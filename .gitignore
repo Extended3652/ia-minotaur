@@ -1,8 +1,17 @@
-
 # secrets
 config.env
 .env
 *.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtualenv
+venv/
+.env/
 
 # editor/backups
 *.bak
