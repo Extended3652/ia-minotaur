@@ -883,17 +883,36 @@ class RetroWaveIA:
         staging_path = staging_file_path(identifier, filename)
         if not os.path.exists(staging_path):
             return f"Downloaded, but staging file not found: {staging_path}"
-
+    
+        # --- helpers (local, minimal impact) ---
+        def has_year_hint(s: str) -> bool:
+            if not s:
+                return False
+            # common patterns: "(1993)", "1993", "- 1993 -"
+            return bool(re.search(r"\((19|20)\d{2}\)", s) or re.search(r"(19|20)\d{2}", s))
+    
+        def is_single_large_video(name: str) -> bool:
+            try:
+                video_files = [f for f in self.files if is_video_file(f.name, f.fmt)]
+                large_video_files = [f for f in video_files if int(f.size or 0) >= LARGE_VIDEO_BYTES]
+                return (len(large_video_files) == 1 and (large_video_files[0].name or "") == name)
+            except Exception:
+                return False
+    
+        ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
+    
+        # Start from last bucket, but allow smart overrides
         bucket = self.last_bucket if self.last_bucket in ("TV", "Movies", "Other") else "Other"
-
-        # Heuristic: if user is still on TV default, but the item clearly looks like
-        # a single large movie file, route to Movies automatically.
-        if bucket == "TV":
-            video_files = [f for f in self.files if is_video_file(f.name, f.fmt)]
-            large_video_files = [f for f in video_files if int(f.size or 0) >= LARGE_VIDEO_BYTES]
-            if len(large_video_files) == 1 and large_video_files[0].name == filename:
+    
+        # If it clearly looks episodic, force TV regardless of last choice
+        if ep:
+            bucket = "TV"
+        else:
+            # If it looks like a movie, force Movies regardless of last choice
+            # (year hint OR single large video file with no SxxEyy)
+            if has_year_hint(filename) or has_year_hint(item_title) or is_single_large_video(filename):
                 bucket = "Movies"
-
+    
         if bucket == "TV":
             show_default = sanitize_folder(item_title)
             show = self.prompt('Show name (Enter default, or type "*" for favorites): ', show_default)
@@ -904,8 +923,8 @@ class RetroWaveIA:
                 show = pick if pick else show_default
             show = sanitize_folder(show)
             self.add_folder_fav("TV", show)
-
-            ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
+    
+            # If we detected SxxEyy, do not ask season/episode questions
             if ep:
                 season, episode = ep
                 episode_override: Optional[int] = None
@@ -924,18 +943,18 @@ class RetroWaveIA:
                     episode_override = int(e) if e.strip() else None
                 except Exception:
                     episode_override = None
-
+    
             season_dir = os.path.join(BUCKET_TV, show, f"Season {season:02d}")
             os.makedirs(season_dir, exist_ok=True)
-
+    
             new_name = filename
             if ep or episode_override is not None:
                 ext = os.path.splitext(filename)[1] or ".mp4"
                 ep_num = ep[1] if ep else (episode_override if episode_override is not None else 1)
                 new_name = f"{show} - S{season:02d}E{ep_num:02d}{ext}"
-
+    
             final_path = os.path.join(season_dir, new_name)
-
+    
         elif bucket == "Movies":
             title_default = auto_clean_movie_folder_name(item_title, filename)
             movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
@@ -946,11 +965,11 @@ class RetroWaveIA:
                 movie = pick if pick else title_default
             movie = sanitize_folder(movie)
             self.add_folder_fav("Movies", movie)
-
+    
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
             os.makedirs(movie_dir, exist_ok=True)
             final_path = os.path.join(movie_dir, filename)
-
+    
         else:
             sub = self.prompt('Other subfolder (Enter "Misc", or type "*" for favorites): ', "Misc")
             if sub is None:
@@ -960,19 +979,19 @@ class RetroWaveIA:
                 sub = pick if pick else "Misc"
             sub = sanitize_folder(sub)
             self.add_folder_fav("Other", sub)
-
+    
             other_dir = os.path.join(BUCKET_OTHER, sub)
             os.makedirs(other_dir, exist_ok=True)
             final_path = os.path.join(other_dir, filename)
-
+    
         if os.path.exists(final_path):
             base, ext = os.path.splitext(final_path)
             stamp = time.strftime("%Y%m%d_%H%M%S")
             final_path = f"{base}_{stamp}{ext}"
-
+    
         shutil.move(staging_path, final_path)
         return f"Saved: {final_path}"
-
+    
     def set_preview_for_selected(self) -> None:
         if not self.results:
             self.status = "No item selected."
