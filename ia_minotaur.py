@@ -30,6 +30,19 @@ MIN_W = 70
 # This also reduces confusion when verifying "new downloads" by timestamp.
 IA_NO_CHANGE_TIMESTAMP = True
 
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+VIDEO_FORMAT_HINTS = (
+    "h.264",
+    "h264",
+    "mpeg4",
+    "mp4",
+    "matroska",
+    "webm",
+    "quicktime",
+    "avi",
+)
+LARGE_VIDEO_BYTES = 500 * 1024 * 1024
+
 
 @dataclass
 class SearchResult:
@@ -112,6 +125,50 @@ def detect_sxxeyy(text: str) -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
+
+
+def is_video_file(name: str, fmt: str = "") -> bool:
+    ext = os.path.splitext((name or "").lower())[1]
+    if ext in VIDEO_EXTS:
+        return True
+    fmt_l = (fmt or "").lower()
+    return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
+
+
+def auto_clean_movie_folder_name(item_title: str, filename: str) -> str:
+    raw = (item_title or "").strip() or (filename or "").strip()
+    raw = os.path.basename(raw)
+    raw = os.path.splitext(raw)[0]
+    raw = re.sub(r"[\[\](){}]", " ", raw)
+    raw = re.sub(r"[._]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+
+    year = ""
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", raw)
+    if year_match:
+        year = year_match.group(1)
+        title_part = raw[: year_match.start()]
+    else:
+        title_part = raw
+
+    scene_rx = re.compile(
+        r"\b(?:"
+        r"2160p|1080p|720p|480p|"
+        r"bluray|brrip|bdrip|webrip|web-dl|hdrip|dvdrip|"
+        r"x264|x265|h264|h265|hevc|av1|"
+        r"aac2?\.0|aac|dts(?:-?hd)?|ddp?5?\.1|ac3|"
+        r"proper|repack|extended|remastered|unrated|"
+        r"yify|yts|rarbg"
+        r")\b",
+        re.IGNORECASE,
+    )
+    title_part = scene_rx.sub(" ", title_part)
+    title_part = re.sub(r"\s+", " ", title_part).strip(" -._")
+
+    cleaned_title = sanitize_folder(title_part or raw)
+    if year:
+        return sanitize_folder(f"{cleaned_title} ({year})")
+    return cleaned_title
 
 
 def build_query(user_text: str, media_filter: str, title_only: bool) -> str:
@@ -553,7 +610,8 @@ class RetroWaveIA:
                 (f"Filter: {self.filter}", "filter"),
                 (f"Title only: {'On' if self.title_only else 'Off'}", "title"),
                 (f"License gate: {'On' if self.enforce_license_gate else 'Off'}", "license_gate"),
-                ("More", "more"),
+                ("Prev", "prev_page"),
+                ("Next", "next_page"),
                 ("Open", "open"),
                 (fav_label, "fav_item"),
                 ("Favs", "favs"),
@@ -767,6 +825,16 @@ class RetroWaveIA:
         self.page += 1
         self.do_search(reset_page=False)
 
+    def prev_page(self) -> None:
+        if not self.query_text:
+            self.status = "No search yet. Choose [Search]."
+            return
+        if self.page <= 1:
+            self.status = "Already on first page."
+            return
+        self.page -= 1
+        self.do_search(reset_page=False)
+
     def load_files(self) -> None:
         if not self.results:
             self.status = "No results to open."
@@ -818,6 +886,14 @@ class RetroWaveIA:
 
         bucket = self.last_bucket if self.last_bucket in ("TV", "Movies", "Other") else "Other"
 
+        # Heuristic: if user is still on TV default, but the item clearly looks like
+        # a single large movie file, route to Movies automatically.
+        if bucket == "TV":
+            video_files = [f for f in self.files if is_video_file(f.name, f.fmt)]
+            large_video_files = [f for f in video_files if int(f.size or 0) >= LARGE_VIDEO_BYTES]
+            if len(large_video_files) == 1 and large_video_files[0].name == filename:
+                bucket = "Movies"
+
         if bucket == "TV":
             show_default = sanitize_folder(item_title)
             show = self.prompt('Show name (Enter default, or type "*" for favorites): ', show_default)
@@ -861,7 +937,7 @@ class RetroWaveIA:
             final_path = os.path.join(season_dir, new_name)
 
         elif bucket == "Movies":
-            title_default = sanitize_folder(item_title)
+            title_default = auto_clean_movie_folder_name(item_title, filename)
             movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
             if movie is None:
                 return f"Left in staging: {staging_path}"
@@ -1713,8 +1789,11 @@ class RetroWaveIA:
                 self.title_only = not self.title_only
                 self.status = "Search mode: title" if self.title_only else "Search mode: broad"
                 return
-            if action == "more":
+            if action == "next_page":
                 self.next_page()
+                return
+            if action == "prev_page":
+                self.prev_page()
                 return
             if action == "open":
                 self.show_welcome = False
