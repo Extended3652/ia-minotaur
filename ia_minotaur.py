@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
 
-MEDIA_ROOT = "/mnt/ssd/media"
+MEDIA_ROOT = os.environ.get("IA_MEDIA_ROOT", "/mnt/ssd/media")
 STAGING_ROOT = os.path.join(MEDIA_ROOT, ".ia_staging")
 
 BUCKET_TV = os.path.join(MEDIA_ROOT, "TV")
@@ -22,6 +22,7 @@ LOG_PATH = os.path.join(MEDIA_ROOT, ".ia_dl.log")
 
 FILTERS = ["movies", "audio", "texts", "software", "any"]
 ROWS_PER_PAGE = 30
+_FULL_ITEM_SENTINEL = "__FULL_ITEM__"
 
 MIN_H = 18
 MIN_W = 70
@@ -525,6 +526,20 @@ class RetroWaveIA:
             self.favs["folders"][bucket] = arr[:30]
             self.save_favs()
 
+    def _get_favs_flat_list(self) -> List[Dict[str, Any]]:
+        """Return a flat list of dicts for the current favs tab (for rendering/indexing)."""
+        tab = self.favs_tab
+        if tab == "ITEMS":
+            return list(self.favs.get("items", []))
+        if tab == "FILES":
+            return list(self.favs.get("files", []))
+        # FOLDERS: flatten all buckets into dicts with a "bucket" key
+        out: List[Dict[str, Any]] = []
+        for bucket in ("TV", "Movies", "Other"):
+            for name in self.favs.get("folders", {}).get(bucket, []):
+                out.append({"bucket": bucket, "name": str(name)})
+        return out
+
     # ---------- safe drawing ----------
     def safe_addstr(self, y: int, x: int, s: str, attr: int = 0) -> None:
         try:
@@ -604,7 +619,12 @@ class RetroWaveIA:
 
     def get_menu_items(self) -> List[Tuple[str, str]]:
         if self.mode in ("RESULTS", "SEARCH"):
-            fav_label = "Fav"
+            is_fav_cur = (
+                bool(self.results)
+                and 0 <= self.sel_r < len(self.results)
+                and self.is_fav_item(self.results[self.sel_r].identifier)
+            )
+            fav_label = "Unfav" if is_fav_cur else "Fav"
             return [
                 ("Search", "search"),
                 (f"Filter: {self.filter}", "filter"),
@@ -692,6 +712,10 @@ class RetroWaveIA:
 
         if self.mode == "DOWNLOADING":
             keybar = "c cancels  |  q quits after cancel  |  (progress updates live)"
+        elif self.mode in ("RESULTS", "SEARCH"):
+            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  s search  |  q quit"
+        elif self.mode == "FILES":
+            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  / keyword  |  Bksp back  |  q quit"
         else:
             keybar = "Arrows move  |  Tab switches menu/list  |  Enter selects  |  q quits"
         self.safe_addstr(h - 2, 0, keybar[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2))
@@ -1012,9 +1036,10 @@ class RetroWaveIA:
         self.preview_prefix = ""
         if ok:
             self.preview_msg = "Open license detected in metadata. You can download after confirmation."
+        elif self.enforce_license_gate:
+            self.preview_msg = f"Download blocked. {why}"
         else:
-            if self.enforce_license_gate:
-                self.preview_msg = f"Download blocked. {why}"
+            self.preview_msg = f"Rights unclear: {why}  You can still download if you confirm."
         self.mode = "PREVIEW_DL"
         self.focus = "MENU"
         self.menu_idx = 0
@@ -1079,7 +1104,7 @@ class RetroWaveIA:
         self.preview_item = item
         self.preview_file = None
         self.preview_files = list(visible)
-        self.preview_prefix = "__FULL_ITEM__"
+        self.preview_prefix = _FULL_ITEM_SENTINEL
 
         if ok:
             self.preview_msg = f"Open license detected. Will download {len(visible)} visible files ({human_size(total)})."
@@ -1117,8 +1142,7 @@ class RetroWaveIA:
             log_line(f"DL_POPEN_ERR: {e}")
             return False, f"download failed: {e}"
 
-        start_t = time.time()
-        last_t = start_t
+        last_t = time.time()
         last_bytes = 0
         self.dl_cancel_requested = False
 
@@ -1200,8 +1224,7 @@ class RetroWaveIA:
             log_line(f"DL_GLOB_POPEN_ERR: {e}")
             return False, f"download failed: {e}"
 
-        start_t = time.time()
-        last_t = start_t
+        last_t = time.time()
         last_bytes = 0
         self.dl_cancel_requested = False
 
@@ -1342,7 +1365,7 @@ class RetroWaveIA:
             self.mode = "DOWNLOADING"
             self.focus = "MENU"
 
-            if self.preview_prefix and self.preview_prefix != "__FULL_ITEM__":
+            if self.preview_prefix and self.preview_prefix != _FULL_ITEM_SENTINEL:
                 # Use ia --glob for prefix downloads.
                 # NOTE: IA globs are matched against the "name" field (including folder paths).
                 # Using prefix* matches "prefix..." including subpaths if prefix includes a folder/ path.
@@ -1455,10 +1478,11 @@ class RetroWaveIA:
             "  - Press c to cancel while downloading.",
             "",
             "Notes:",
-            "  - Downloads are blocked unless metadata indicates an open license (CC/PD).",
+            "  - License gate (toggle in menu) blocks downloads when no open license is found.",
+            "  - Gate is OFF by default: you'll get a warning and must type DOWNLOAD to confirm.",
             "  - Staging is used first, then files are moved into TV/Movies/Other.",
             f"  - {'--no-change-timestamp is enabled (mtimes set to now).' if IA_NO_CHANGE_TIMESTAMP else 'Source mtimes are preserved.'}",
-            "  - Log file: /mnt/ssd/media/.ia_dl.log",
+            f"  - Log file: {LOG_PATH}",
         ]
 
         for line in lines:
@@ -1510,7 +1534,7 @@ class RetroWaveIA:
             ]
         elif item and self.preview_files:
             total = sum(int(f.size or 0) for f in self.preview_files)
-            mode_label = "Full item (visible files)" if self.preview_prefix == "__FULL_ITEM__" else f"Folder/prefix: {self.preview_prefix}"
+            mode_label = "Full item (visible files)" if self.preview_prefix == _FULL_ITEM_SENTINEL else f"Folder/prefix: {self.preview_prefix}"
             lines += [
                 "Preview (no changes)",
                 "",
@@ -1559,10 +1583,20 @@ class RetroWaveIA:
             self.safe_addstr(y, left_w, "│", curses.color_pair(1))
 
         left_title = "RESULTS"
-        if self.mode == "FILES":
+        scroll_info = ""
+        if self.mode in ("RESULTS", "SEARCH") and self.results:
+            left_title = "RESULTS"
+            scroll_info = f" {self.sel_r + 1}/{len(self.results)} "
+        elif self.mode == "FILES":
+            visible = self.get_visible_files()
             left_title = "FILES"
+            if visible:
+                scroll_info = f" {self.sel_f + 1}/{len(visible)} "
         elif self.mode == "FAVS":
+            fav_list = self._get_favs_flat_list()
             left_title = f"FAVORITES ({self.favs_tab})"
+            if fav_list:
+                scroll_info = f" {self.favs_idx + 1}/{len(fav_list)} "
         elif self.mode == "HELP":
             left_title = "HELP"
         elif self.mode == "DOWNLOADING":
@@ -1572,7 +1606,8 @@ class RetroWaveIA:
         elif self.mode == "PREVIEW_DL":
             left_title = "PREVIEW"
 
-        self.safe_addstr(body_top, 0, f" {left_title} ".ljust(max(0, left_w - 1), "─"), curses.color_pair(2))
+        panel_header = f" {left_title}{scroll_info}"
+        self.safe_addstr(body_top, 0, panel_header.ljust(max(0, left_w - 1), "─"), curses.color_pair(2))
         self.safe_addstr(body_top, right_x, " DETAILS ".ljust(max(0, right_w), "─")[: max(0, right_w)], curses.color_pair(2))
 
         list_top = body_top + 1
@@ -1633,6 +1668,35 @@ class RetroWaveIA:
                     else:
                         self.safe_addstr(list_top + (i - start), 0, line, curses.color_pair(6))
 
+        elif self.mode == "FAVS":
+            fav_list = self._get_favs_flat_list()
+            if self.favs_idx >= len(fav_list) and fav_list:
+                self.favs_idx = len(fav_list) - 1
+            if not fav_list:
+                self.safe_addstr(list_top, 0, "(no favorites yet)".ljust(max(0, left_w - 1)), curses.color_pair(6))
+            else:
+                start = 0
+                if self.favs_idx >= max_rows:
+                    start = self.favs_idx - max_rows + 1
+                for i in range(start, min(len(fav_list), start + max_rows)):
+                    entry = fav_list[i]
+                    marker = ">" if i == self.favs_idx else " "
+                    if self.favs_tab == "ITEMS":
+                        y_str = f" ({entry.get('year', '')})" if entry.get("year") else ""
+                        line = f"{marker} {i+1:02d} │ {entry.get('title', entry.get('identifier', '?'))}{y_str}"
+                    elif self.favs_tab == "FILES":
+                        line = f"{marker} {i+1:02d} │ {human_size(int(entry.get('size', 0))):>9}  {entry.get('filename', '?')}"
+                    else:
+                        line = f"{marker} {i+1:02d} │ [{entry.get('bucket', '?')}] {entry.get('name', '?')}"
+                    line = line[: max(0, left_w - 1)].ljust(max(0, left_w - 1))
+                    if i == self.favs_idx:
+                        attr = curses.color_pair(7) if self.focus == "LIST" else curses.color_pair(6)
+                        if self.focus == "LIST":
+                            attr |= curses.A_BOLD
+                        self.safe_addstr(list_top + (i - start), 0, line, attr)
+                    else:
+                        self.safe_addstr(list_top + (i - start), 0, line, curses.color_pair(6))
+
         ry = list_top
         details: List[str] = []
 
@@ -1681,6 +1745,35 @@ class RetroWaveIA:
             if self.cur_meta:
                 ok2, why2 = is_openly_licensed(self.cur_meta)
                 details += ["", "License gate:", f"  {'ALLOW' if ok2 else 'BLOCK'}", f"  {why2}"]
+
+        elif self.mode == "FAVS":
+            fav_list = self._get_favs_flat_list()
+            entry = fav_list[self.favs_idx] if (fav_list and 0 <= self.favs_idx < len(fav_list)) else None
+            details = [f"Favorites ({self.favs_tab})", f"  {len(fav_list)} entries", ""]
+            if entry:
+                if self.favs_tab == "ITEMS":
+                    details += [
+                        "Selected:",
+                        f"  {entry.get('title', '(no title)')}",
+                        f"  ID: {entry.get('identifier', '?')}",
+                        f"  Year: {entry.get('year', '')}",
+                        f"  Creator: {entry.get('creator', '')}",
+                        "",
+                        "Enter or [Open] to browse files.",
+                    ]
+                elif self.favs_tab == "FILES":
+                    details += [
+                        "Selected:",
+                        f"  {entry.get('filename', '?')}",
+                        f"  Item: {entry.get('item_title', '?')}",
+                        f"  Size: {human_size(int(entry.get('size', 0)))}",
+                        f"  Fmt: {entry.get('fmt', '')}",
+                    ]
+                else:
+                    details += [
+                        "Selected folder:",
+                        f"  [{entry.get('bucket', '?')}] {entry.get('name', '?')}",
+                    ]
 
         elif self.mode == "DOWNLOADING":
             details = [
@@ -1891,11 +1984,63 @@ class RetroWaveIA:
                 return
 
             if action == "remove":
-                self.status = "Remove not implemented in this build."
+                fav_list = self._get_favs_flat_list()
+                if not fav_list or not (0 <= self.favs_idx < len(fav_list)):
+                    self.status = "Nothing selected."
+                    return
+                tab = self.favs_tab
+                if tab == "ITEMS":
+                    removed = self.favs["items"].pop(self.favs_idx)
+                    self.status = f"Removed item: {removed.get('title', removed.get('identifier', '?'))}"
+                elif tab == "FILES":
+                    removed = self.favs["files"].pop(self.favs_idx)
+                    self.status = f"Removed file: {removed.get('filename', '?')}"
+                else:
+                    entry = fav_list[self.favs_idx]
+                    bucket = entry.get("bucket", "")
+                    name = entry.get("name", "")
+                    arr = self.favs.get("folders", {}).get(bucket, [])
+                    if name in arr:
+                        arr.remove(name)
+                        self.favs["folders"][bucket] = arr
+                    self.status = f"Removed folder: [{bucket}] {name}"
+                self.favs_idx = max(0, self.favs_idx - 1)
+                self.save_favs()
                 return
 
             if action == "primary":
-                self.status = "Primary not implemented in this build."
+                fav_list = self._get_favs_flat_list()
+                if not fav_list or not (0 <= self.favs_idx < len(fav_list)):
+                    self.status = "Nothing selected."
+                    return
+                tab = self.favs_tab
+                if tab == "ITEMS":
+                    entry = fav_list[self.favs_idx]
+                    ident = entry.get("identifier", "")
+                    if not ident:
+                        self.status = "Invalid identifier."
+                        return
+                    r = SearchResult(
+                        identifier=ident,
+                        title=entry.get("title", "(unknown)"),
+                        year=entry.get("year", ""),
+                        creator=entry.get("creator", ""),
+                    )
+                    # Prepend to results so it's easy to navigate to
+                    existing = [x.identifier for x in self.results]
+                    if ident not in existing:
+                        self.results.insert(0, r)
+                    else:
+                        self.sel_r = existing.index(ident)
+                    self.sel_r = 0
+                    self.mode = "RESULTS"
+                    self.status = f"Opening {ident}..."
+                    self.render()
+                    self.load_files()
+                elif tab == "FILES":
+                    self.status = "To re-download a file favorite, open its item from the ITEMS tab."
+                else:
+                    self.status = "Folder favorites are used as quick picks during download naming."
                 return
 
     # ---------- input loop ----------
@@ -1928,6 +2073,23 @@ class RetroWaveIA:
             if ch == 9:  # Tab
                 self.focus = "LIST" if self.focus == "MENU" else "MENU"
                 self.status = "Focus: MENU" if self.focus == "MENU" else "Focus: LIST"
+                continue
+
+            # Global shortcuts (work regardless of focus)
+            if self.mode in ("RESULTS", "SEARCH") and ch in (ord("s"), ord("S")):
+                s = self.prompt("Search: ", self.query_text)
+                if s is not None:
+                    self.query_text = s
+                    self.show_welcome = False
+                    self.do_search(reset_page=True)
+                continue
+
+            if self.mode == "FILES" and ch == ord("/"):
+                s = self.prompt("Keyword (blank clears): ", self.file_kw)
+                if s is not None:
+                    self.file_kw = s.strip()
+                    self.sel_f = 0
+                    self.status = "Keyword updated"
                 continue
 
             items = self.get_menu_items()
@@ -1974,6 +2136,18 @@ class RetroWaveIA:
                         self.mode = "RESULTS"
                         self.focus = "LIST"
                         self.status = "Back to results"
+                        continue
+
+                if self.mode == "FAVS":
+                    fav_list = self._get_favs_flat_list()
+                    if ch == curses.KEY_UP:
+                        self.favs_idx = max(0, self.favs_idx - 1)
+                        continue
+                    if ch == curses.KEY_DOWN:
+                        self.favs_idx = min(max(0, len(fav_list) - 1), self.favs_idx + 1)
+                        continue
+                    if ch in (10, 13, curses.KEY_ENTER):
+                        self.activate_menu_action("primary")
                         continue
 
         # exit
