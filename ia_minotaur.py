@@ -822,8 +822,17 @@ class RetroWaveIA:
         if not self.query_text:
             self.status = "No search yet. Choose [Search]."
             return
+        saved_focus = self.focus
+        saved_menu_idx = self.menu_idx
+        saved_page = self.page
         self.page += 1
         self.do_search(reset_page=False)
+        if not self.results:
+            self.page = saved_page
+            self.status = "No more results (rolled back to previous page)."
+        # Keep menu focus so the user can immediately paginate again.
+        self.focus = saved_focus
+        self.menu_idx = saved_menu_idx
 
     def prev_page(self) -> None:
         if not self.query_text:
@@ -832,8 +841,17 @@ class RetroWaveIA:
         if self.page <= 1:
             self.status = "Already on first page."
             return
+        saved_focus = self.focus
+        saved_menu_idx = self.menu_idx
+        saved_page = self.page
         self.page -= 1
         self.do_search(reset_page=False)
+        if not self.results:
+            self.page = saved_page
+            self.status = "No results on that page (rolled back)."
+        # Keep menu focus so the user can immediately paginate again.
+        self.focus = saved_focus
+        self.menu_idx = saved_menu_idx
 
     def load_files(self) -> None:
         if not self.results:
