@@ -604,7 +604,11 @@ class RetroWaveIA:
 
     def get_menu_items(self) -> List[Tuple[str, str]]:
         if self.mode in ("RESULTS", "SEARCH"):
-            fav_label = "Fav"
+            fav_label = (
+                "Unfav" if (self.results and 0 <= self.sel_r < len(self.results)
+                            and self.is_fav_item(self.results[self.sel_r].identifier))
+                else "Fav"
+            )
             return [
                 ("Search", "search"),
                 (f"Filter: {self.filter}", "filter"),
@@ -1033,6 +1037,8 @@ class RetroWaveIA:
         else:
             if self.enforce_license_gate:
                 self.preview_msg = f"Download blocked. {why}"
+            else:
+                self.preview_msg = f"Rights unclear. {why}  You can still download if you confirm."
         self.mode = "PREVIEW_DL"
         self.focus = "MENU"
         self.menu_idx = 0
@@ -1102,7 +1108,10 @@ class RetroWaveIA:
         if ok:
             self.preview_msg = f"Open license detected. Will download {len(visible)} visible files ({human_size(total)})."
         else:
-            self.preview_msg = f"Download blocked. {why}"
+            if self.enforce_license_gate:
+                self.preview_msg = f"Download blocked. {why}"
+            else:
+                self.preview_msg = f"Rights unclear. {why}  You can still download if you confirm."
 
         self.mode = "PREVIEW_DL"
         self.focus = "MENU"
@@ -1608,7 +1617,8 @@ class RetroWaveIA:
                 for i in range(start, min(len(self.results), start + max_rows)):
                     r = self.results[i]
                     marker = ">" if i == self.sel_r else " "
-                    idx = f"{i+1:02d}"
+                    abs_num = (self.page - 1) * ROWS_PER_PAGE + i + 1
+                    idx = f"{abs_num:02d}"
                     title = (r.title or "")[:40]
                     year = f" ({r.year})" if r.year else ""
                     star = "*" if self.is_fav_item(r.identifier) else " "
@@ -1740,11 +1750,9 @@ class RetroWaveIA:
         h, w = self.stdscr.getmaxyx()
 
         if self.term_too_small():
-            self.mode = "TOO_SMALL"
             self.safe_addstr(0, 0, "Terminal too small.", curses.color_pair(5) | curses.A_BOLD)
             self.safe_addstr(2, 0, f"Need at least {MIN_W}x{MIN_H}. Current: {w}x{h}", curses.color_pair(6))
             self.safe_addstr(4, 0, "Resize your terminal window.", curses.color_pair(6))
-            self.draw_footer(h, w)
             self.stdscr.refresh()
             return
 
@@ -1940,7 +1948,7 @@ class RetroWaveIA:
                     continue
                 break
 
-            if self.mode in ("ERROR", "TOO_SMALL"):
+            if self.mode == "ERROR" or self.term_too_small():
                 continue
 
             if ch == 9:  # Tab
@@ -1963,6 +1971,14 @@ class RetroWaveIA:
                         _label, action = items[self.menu_idx]
                         self.activate_menu_action(action)
                     continue
+
+            if ch == ord('/'):
+                s = self.prompt("Search: ", self.query_text)
+                if s is not None:
+                    self.query_text = s
+                    self.show_welcome = False
+                    self.do_search(reset_page=True)
+                continue
 
             if self.focus == "LIST":
                 if self.mode in ("RESULTS", "SEARCH"):
