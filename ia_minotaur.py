@@ -206,9 +206,7 @@ def ia_ok() -> Tuple[bool, str]:
     return False, msg or "ia not available"
 
 
-def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchResult], str]:
-    start = max(0, (page - 1) * rows)
-
+def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchResult], int, str]:
     cmd = [
         "curl",
         "-sS",
@@ -229,20 +227,22 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         "--data-urlencode",
         f"rows={rows}",
         "--data-urlencode",
-        f"start={start}",
+        f"page={page}",
     ]
 
     code, out, err = run_cmd(cmd, timeout=60)
     if code != 0:
         msg = (err or out).strip()
-        return [], msg or f"search failed (code {code})"
+        return [], 0, msg or f"search failed (code {code})"
 
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        return [], "search returned non-JSON"
+        return [], 0, "search returned non-JSON"
 
-    docs = (((data or {}).get("response") or {}).get("docs") or [])
+    response = (data or {}).get("response") or {}
+    num_found = int(response.get("numFound") or 0)
+    docs = response.get("docs") or []
     results: List[SearchResult] = []
     for d in docs:
         ident = str(d.get("identifier", "")).strip()
@@ -253,7 +253,7 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         creator = str(d.get("creator", "")).strip()
         results.append(SearchResult(ident, title, year, creator))
 
-    return results, ""
+    return results, num_found, ""
 
 
 def ia_metadata_json(identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -369,6 +369,7 @@ class RetroWaveIA:
         self.title_only = False
         self.enforce_license_gate = False
         self.page = 1
+        self.total_results: int = 0
 
         self.results: List[SearchResult] = []
         self.sel_r = 0
@@ -595,10 +596,18 @@ class RetroWaveIA:
         elif self.mode == "ERROR":
             header = "Error"
 
-        line1 = f"{header}  |  Filter: {self.filter}  |  Search: {search_mode}  |  Page: {self.page}"
+        if self.total_results > 0:
+            total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+            page_info = f"Page: {self.page}/{total_pages}  ({self.total_results} found)"
+        else:
+            page_info = f"Page: {self.page}"
+        line1 = f"{header}  |  Filter: {self.filter}  |  Search: {search_mode}  |  {page_info}"
         self.safe_addstr(y, 0, line1[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
 
-        line2 = f"Root: {MEDIA_ROOT}   Staging: {STAGING_ROOT}"
+        if self.query_built and self.mode in ("RESULTS", "SEARCH"):
+            line2 = f"Query: {self.query_built[:60]}   Root: {MEDIA_ROOT}"
+        else:
+            line2 = f"Root: {MEDIA_ROOT}   Staging: {STAGING_ROOT}"
         self.safe_addstr(y, 0, line2[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
         return y
 
@@ -696,6 +705,8 @@ class RetroWaveIA:
 
         if self.mode == "DOWNLOADING":
             keybar = "c cancels  |  q quits after cancel  |  (progress updates live)"
+        elif self.mode in ("RESULTS", "SEARCH"):
+            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  n/p or [ ] page  |  / search  |  q quit"
         else:
             keybar = "Arrows move  |  Tab switches menu/list  |  Enter selects  |  q quits"
         self.safe_addstr(h - 2, 0, keybar[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2))
@@ -812,7 +823,7 @@ class RetroWaveIA:
         self.status = "Searching..."
         self.render()
 
-        self.results, err = ia_search_via_curl(self.query_built, rows=ROWS_PER_PAGE, page=self.page)
+        self.results, self.total_results, err = ia_search_via_curl(self.query_built, rows=ROWS_PER_PAGE, page=self.page)
         if err:
             self.status = err
             return
@@ -820,7 +831,11 @@ class RetroWaveIA:
         self.sel_r = 0
         self.mode = "RESULTS"
         self.focus = "LIST"
-        self.status = f"Found {len(self.results)} results. Use arrows, then [Open]."
+        if self.total_results > 0:
+            total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+            self.status = f"Page {self.page}/{total_pages} — {self.total_results} total results. Arrows to select, Enter to open."
+        else:
+            self.status = f"Page {self.page} — {len(self.results)} results. Arrows to select, Enter to open."
 
     def next_page(self) -> None:
         if not self.query_text:
@@ -1611,6 +1626,16 @@ class RetroWaveIA:
             if not self.results:
                 self.safe_addstr(list_top, 0, "Choose [Search] in the menu to begin.".ljust(max(0, left_w - 1)), curses.color_pair(6))
             else:
+                start_n = (self.page - 1) * ROWS_PER_PAGE + 1
+                end_n = (self.page - 1) * ROWS_PER_PAGE + len(self.results)
+                if self.total_results > 0:
+                    total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+                    phdr = f" Results {start_n}–{end_n} of {self.total_results}  (page {self.page}/{total_pages})  [ ] or n/p to page"
+                else:
+                    phdr = f" Results {start_n}–{end_n}  (page {self.page})"
+                self.safe_addstr(list_top, 0, phdr[: max(0, left_w - 1)].ljust(max(0, left_w - 1)), curses.color_pair(3))
+                list_top += 1
+                max_rows = max(0, max_rows - 1)
                 start = 0
                 if self.sel_r >= max_rows:
                     start = self.sel_r - max_rows + 1
@@ -1991,6 +2016,12 @@ class RetroWaveIA:
                     if ch in (10, 13, curses.KEY_ENTER):
                         self.show_welcome = False
                         self.load_files()
+                        continue
+                    if ch in (ord('n'), ord(']'), curses.KEY_NPAGE):
+                        self.next_page()
+                        continue
+                    if ch in (ord('p'), ord('['), curses.KEY_PPAGE):
+                        self.prev_page()
                         continue
 
                 if self.mode == "FILES":
